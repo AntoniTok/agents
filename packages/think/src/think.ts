@@ -5169,11 +5169,14 @@ export class Think<
     }
 
     inferenceStreamFinalizers.delete(result);
+    // Invoke exactly once: start the drain, then try to extend its lifetime.
+    // A missing/throwing waitUntil must not start a second tee consumer.
+    const completion = finalize();
     try {
-      this.ctx.waitUntil(finalize());
+      this.ctx.waitUntil(completion);
     } catch {
-      // waitUntil unavailable (tests, exotic contexts): still drain.
-      void finalize();
+      // waitUntil unavailable (tests, exotic contexts): the drain is already
+      // running; nothing further to attach it to.
     }
   }
 
@@ -11521,6 +11524,10 @@ export class Think<
 
     const stallTimeoutMs =
       this._activeStallTimeoutMs ?? this.chatStreamStallTimeoutMs;
+    // True only when the wrapped stream was pulled to natural exhaustion; a
+    // break OR a throw (stall watchdog) leaves it false so the finally drains
+    // the abandoned tee branch.
+    let streamDrainedNaturally = false;
     try {
       this._insideInferenceLoop = true;
       const flushState = { chunksSinceFlush: 0, hasFlushedContent: false };
@@ -11617,9 +11624,21 @@ export class Think<
           });
           await callback.onEvent(chunkBody);
         }
+        streamDrainedNaturally = !(
+          aborted ||
+          overflowRetry ||
+          streamError !== undefined
+        );
       } finally {
         this._insideInferenceLoop = false;
-        this._drainInferenceStream(result);
+        // Only early exits leave an abandoned tee branch; a naturally
+        // exhausted stream needs no drain (consumeStream is not free — it
+        // tees the base stream and traverses the buffered branch). A thrown
+        // exit (stall watchdog) never reaches the assignment above, so it
+        // drains too.
+        if (!streamDrainedNaturally) {
+          this._drainInferenceStream(result);
+        }
       }
 
       // Recoverable context overflow: discard the partial, close the stream
@@ -11963,6 +11982,10 @@ export class Think<
 
     const stallTimeoutMs =
       this._activeStallTimeoutMs ?? this.chatStreamStallTimeoutMs;
+    // True only when the wrapped stream was pulled to natural exhaustion; a
+    // break OR a throw (stall watchdog) leaves it false so the finally drains
+    // the abandoned tee branch.
+    let streamDrainedNaturally = false;
     try {
       this._insideInferenceLoop = true;
       try {
@@ -12082,9 +12105,21 @@ export class Think<
             ...(continuation && { continuation: true })
           });
         }
+        streamDrainedNaturally = !(
+          streamAborted ||
+          overflowRetry ||
+          streamError !== undefined
+        );
       } finally {
         this._insideInferenceLoop = false;
-        this._drainInferenceStream(result);
+        // Only early exits leave an abandoned tee branch; a naturally
+        // exhausted stream needs no drain (consumeStream is not free — it
+        // tees the base stream and traverses the buffered branch). A thrown
+        // exit (stall watchdog) never reaches the assignment above, so it
+        // drains too.
+        if (!streamDrainedNaturally) {
+          this._drainInferenceStream(result);
+        }
       }
 
       // Recoverable context overflow: discard the partial, close this stream
