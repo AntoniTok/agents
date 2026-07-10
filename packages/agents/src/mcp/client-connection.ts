@@ -6,6 +6,7 @@ import {
 } from "@modelcontextprotocol/sdk/client/sse.js";
 import {
   StreamableHTTPClientTransport,
+  StreamableHTTPError,
   type StreamableHTTPClientTransportOptions
 } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 // Import types directly from MCP SDK
@@ -109,6 +110,13 @@ export type MCPClientConnectionResult = {
 export type MCPDiscoveryResult = {
   success: boolean;
   error?: string;
+  /**
+   * Set when a resumed streamable-http session was rejected with an HTTP 404
+   * during discovery: the server no longer knows the persisted session, so
+   * the caller must clear it and re-initialize without a session ID.
+   * @internal
+   */
+  staleSession?: boolean;
 };
 
 /**
@@ -619,6 +627,17 @@ export class MCPClientConnection {
       this.connectionState = MCPConnectionState.CONNECTED;
 
       const error = e instanceof Error ? e.message : String(e);
+      // An HTTP 404 while probing a resumed streamable-http session means
+      // the server expired the persisted session. The MCP spec requires
+      // starting a new session by re-initializing without a session ID —
+      // flag it so the manager can clear the session and reconnect.
+      if (
+        this._probingCapabilities &&
+        e instanceof StreamableHTTPError &&
+        e.code === 404
+      ) {
+        return { success: false, error, staleSession: true };
+      }
       return { success: false, error };
     } finally {
       // Clean up the abort controller
@@ -805,6 +824,19 @@ export class MCPClientConnection {
     }
 
     return undefined;
+  }
+
+  /**
+   * Drop the session resumed from storage so the next init() performs a
+   * fresh initialize handshake instead of resuming. The live transport is
+   * discarded by init() re-entry; new transports are built from the
+   * transport options.
+   * @internal
+   */
+  clearResumedSession(): void {
+    if ("sessionId" in this.options.transport) {
+      delete this.options.transport.sessionId;
+    }
   }
 
   private getTransportName(

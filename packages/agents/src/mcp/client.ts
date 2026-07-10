@@ -1594,7 +1594,57 @@ export class MCPClientManager {
     }
 
     // Delegate to connection's discover method which handles cancellation and timeout
-    const result = await conn.discover(options);
+    const { staleSession, ...result } = await conn.discover(options);
+    if (staleSession) {
+      return this._recoverStaleSession(conn, serverId, options);
+    }
+    this._onServerStateChanged.fire();
+
+    return {
+      ...result,
+      state: conn.connectionState
+    };
+  }
+
+  /**
+   * A resumed streamable-http session was rejected with a 404: the server no
+   * longer knows the persisted sessionId. Per the MCP spec the client MUST
+   * start a new session by re-initializing without a session ID, so drop the
+   * stale session from memory and storage, reconnect (init() performs a
+   * fresh initialize handshake) and discover once. Runs at most once per
+   * discover call — a repeated failure is returned as-is.
+   */
+  private async _recoverStaleSession(
+    conn: MCPClientConnection,
+    serverId: string,
+    options: { timeoutMs?: number }
+  ): Promise<MCPDiscoverResult> {
+    conn.clearResumedSession();
+    this.updateStoredSessionId(serverId, undefined);
+
+    let connectResult: MCPConnectionResult;
+    try {
+      connectResult = await this.connectToServer(serverId);
+    } catch (error) {
+      return {
+        success: false,
+        error: toErrorMessage(error),
+        state: conn.connectionState
+      };
+    }
+
+    if (connectResult.state !== MCPConnectionState.CONNECTED) {
+      return {
+        success: false,
+        error:
+          connectResult.state === MCPConnectionState.FAILED
+            ? connectResult.error
+            : `Connection in ${connectResult.state} state after session re-initialization`,
+        state: conn.connectionState
+      };
+    }
+
+    const { staleSession: _, ...result } = await conn.discover(options);
     this._onServerStateChanged.fire();
 
     return {
