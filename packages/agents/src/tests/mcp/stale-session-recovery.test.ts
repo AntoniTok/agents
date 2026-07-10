@@ -357,4 +357,52 @@ describe("MCP streamable-http stale session recovery", () => {
     expect(clearResumedSession).toHaveBeenCalledOnce();
     expect(getStoredSessionId(rows, serverId)).toBeUndefined();
   });
+
+  it("returns the connect failure without re-discovering when the fresh connection does not connect", async () => {
+    const { rows, storage } = createManagerStorage();
+    const manager = new MCPClientManager("test-client", "1.0.0", {
+      storage
+    });
+    const serverId = "failed-after-stale-session";
+
+    await manager.registerServer(serverId, {
+      url: "http://example.com/mcp",
+      name: "Failed Stale Session Server",
+      transport: { type: "streamable-http" }
+    });
+
+    const row = rows.get(serverId);
+    const serverOptions = JSON.parse(row?.server_options ?? "{}");
+    serverOptions.transport.sessionId = "expired-session-id";
+    if (row) {
+      rows.set(serverId, {
+        ...row,
+        server_options: JSON.stringify(serverOptions)
+      });
+    }
+
+    const connection = manager.mcpConnections[serverId];
+    connection.connectionState = "connected";
+    const discover = vi.fn().mockResolvedValue({
+      success: false,
+      error: "Streamable HTTP error: unknown session",
+      staleSession: true
+    });
+    connection.discover = discover;
+    vi.spyOn(manager, "connectToServer").mockResolvedValue({
+      state: "failed",
+      error: "server refused the fresh session"
+    });
+
+    const result = await manager.discoverIfConnected(serverId);
+
+    // The reconnect settled without reaching CONNECTED, so the recovery must
+    // report that failure as-is — not run discovery against a connection
+    // that has no live session.
+    expect(result).toMatchObject({
+      success: false,
+      error: "server refused the fresh session"
+    });
+    expect(discover).toHaveBeenCalledTimes(1);
+  });
 });
