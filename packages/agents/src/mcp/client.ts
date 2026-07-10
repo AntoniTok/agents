@@ -1590,18 +1590,10 @@ export class MCPClientManager {
         return this.oauthCallbackSuccess(serverId, conn);
       }
 
-      // checkState proved the nonce genuine above, so also let a FAILED
-      // connection complete: a stray or invalid callback may have spuriously
-      // failed the authorization this callback finishes.
-      if (
-        conn.connectionState !== MCPConnectionState.AUTHENTICATING &&
-        conn.connectionState !== MCPConnectionState.FAILED
-      ) {
-        throw new Error(
-          `Failed to authenticate: the client is in "${conn.connectionState}" state, expected "authenticating"`
-        );
-      }
-
+      // The auth-accepted states returned above. The two remaining states are
+      // AUTHENTICATING and FAILED; both may complete once checkState has
+      // proved the callback genuine. Accepting FAILED lets a valid callback
+      // recover a flow that an earlier stray callback disrupted.
       conn.connectionState = MCPConnectionState.CONNECTING;
       await authProvider.consumeState(state);
       await this.completeAuthorizationAndCleanupVerifier(
