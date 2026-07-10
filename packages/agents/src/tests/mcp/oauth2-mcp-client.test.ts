@@ -162,7 +162,8 @@ describe("OAuth2 MCP Client - addMcpServer on restored connections", () => {
     const agentStub = env.TestOAuthAgent.get(agentId);
     const serverId = nanoid(8);
     const serverUrl = "http://example.com/mcp";
-    const authUrl = "https://auth.example.com/oauth/authorize";
+    const nonce = nanoid();
+    const authUrl = `https://auth.example.com/oauth/authorize?state=${nonce}.${serverId}`;
 
     await restoreOAuthConnection(
       agentStub,
@@ -171,6 +172,7 @@ describe("OAuth2 MCP Client - addMcpServer on restored connections", () => {
       serverUrl,
       authUrl
     );
+    await agentStub.seedPersistedOAuthState(serverId, nonce);
     expect(await agentStub.hasMcpConnection(serverId)).toBe(true);
 
     const result = await agentStub.testAddMcpServer(
@@ -192,6 +194,8 @@ describe("OAuth2 MCP Client - addMcpServer on restored connections", () => {
     const serverId = nanoid(8);
     const serverUrl = "http://example.com/mcp";
     const callbackUrl = `http://example.com/agents/test-o-auth-agent/${agentId.toString()}/callback`;
+    const liveState = await createStateWithSetup(agentStub, serverId);
+    const liveAuthUrl = `http://example.com/oauth/authorize?state=${liveState}`;
 
     await agentStub.setName("default");
     await agentStub.setupMockMcpConnection(
@@ -202,6 +206,7 @@ describe("OAuth2 MCP Client - addMcpServer on restored connections", () => {
       "client-id"
     );
     await agentStub.setupMockOAuthState(serverId, "test-code", "test-state");
+    await agentStub.setLiveAuthUrlForTest(serverId, liveAuthUrl);
     await agentStub.sql`
       UPDATE cf_agents_mcp_servers
       SET auth_url = ${"https://stored.example.com/oauth/authorize"}
@@ -216,7 +221,7 @@ describe("OAuth2 MCP Client - addMcpServer on restored connections", () => {
     expect(result).toEqual({
       id: serverId,
       state: "authenticating",
-      authUrl: "http://example.com/oauth/authorize"
+      authUrl: liveAuthUrl
     });
   });
 
@@ -341,6 +346,123 @@ describe("OAuth2 MCP Client - addMcpServer on restored connections", () => {
         serverUrl
       )
     ).toBe("OAuth configuration incomplete: missing authUrl");
+  });
+
+  it("reconnects instead of returning a persisted auth URL whose state nonce has expired", async () => {
+    const agentName = `test-add-mcp-server-stale-url-${nanoid(8)}`;
+    const agentId = env.TestOAuthAgent.idFromName(agentName);
+    const agentStub = env.TestOAuthAgent.get(agentId);
+    const serverId = nanoid(8);
+    const serverUrl = "http://example.com/mcp";
+    const nonce = nanoid();
+    const staleAuthUrl = `https://auth.example.com/oauth/authorize?state=${nonce}.${serverId}`;
+    const freshAuthUrl = `https://auth.example.com/oauth/fresh/${serverId}`;
+
+    await restoreOAuthConnection(
+      agentStub,
+      agentName,
+      serverId,
+      serverUrl,
+      staleAuthUrl
+    );
+    // The nonce embedded in the persisted URL is older than the 10 minute
+    // state TTL, so following that URL could no longer complete.
+    await agentStub.seedPersistedOAuthState(serverId, nonce, 11 * 60 * 1000);
+    await agentStub.configureMcpReconnect(
+      serverId,
+      "authenticating",
+      freshAuthUrl
+    );
+
+    const result = await agentStub.testAddMcpServer(
+      "test-oauth-server",
+      serverUrl
+    );
+
+    expect(result).toEqual({
+      id: serverId,
+      state: "authenticating",
+      authUrl: freshAuthUrl
+    });
+    expect((await agentStub.getMcpServerFromDb(serverId))?.auth_url).toBe(
+      freshAuthUrl
+    );
+  });
+
+  it("reconnects instead of returning a live auth URL whose state nonce has expired", async () => {
+    const agentName = `test-add-mcp-server-stale-live-url-${nanoid(8)}`;
+    const agentId = env.TestOAuthAgent.idFromName(agentName);
+    const agentStub = env.TestOAuthAgent.get(agentId);
+    const serverId = nanoid(8);
+    const serverUrl = "http://example.com/mcp";
+    const nonce = nanoid();
+    const staleAuthUrl = `https://auth.example.com/oauth/authorize?state=${nonce}.${serverId}`;
+    const freshAuthUrl = `https://auth.example.com/oauth/fresh/${serverId}`;
+
+    await restoreOAuthConnection(
+      agentStub,
+      agentName,
+      serverId,
+      serverUrl,
+      staleAuthUrl
+    );
+    // The DO never hibernated: the connection still holds its auth URL in
+    // memory, but the nonce embedded in it is older than the 10 minute state
+    // TTL, so following that URL could no longer complete.
+    await agentStub.setLiveAuthUrlForTest(serverId, staleAuthUrl);
+    await agentStub.seedPersistedOAuthState(serverId, nonce, 11 * 60 * 1000);
+    await agentStub.configureMcpReconnect(
+      serverId,
+      "authenticating",
+      freshAuthUrl
+    );
+
+    const result = await agentStub.testAddMcpServer(
+      "test-oauth-server",
+      serverUrl
+    );
+
+    expect(result).toEqual({
+      id: serverId,
+      state: "authenticating",
+      authUrl: freshAuthUrl
+    });
+    expect((await agentStub.getMcpServerFromDb(serverId))?.auth_url).toBe(
+      freshAuthUrl
+    );
+  });
+
+  it("reconnects instead of returning a persisted auth URL with no redeemable state nonce", async () => {
+    const agentName = `test-add-mcp-server-unknown-nonce-${nanoid(8)}`;
+    const agentId = env.TestOAuthAgent.idFromName(agentName);
+    const agentStub = env.TestOAuthAgent.get(agentId);
+    const serverId = nanoid(8);
+    const serverUrl = "http://example.com/mcp";
+    const staleAuthUrl = `https://auth.example.com/oauth/authorize?state=${nanoid()}.${serverId}`;
+    const freshAuthUrl = `https://auth.example.com/oauth/fresh/${serverId}`;
+
+    // No state row is seeded: the nonce embedded in the persisted URL is not
+    // redeemable, e.g. it was already consumed or cleaned up.
+    await restoreOAuthConnection(
+      agentStub,
+      agentName,
+      serverId,
+      serverUrl,
+      staleAuthUrl
+    );
+    await agentStub.configureMcpReconnect(
+      serverId,
+      "authenticating",
+      freshAuthUrl
+    );
+
+    expect(
+      await agentStub.testAddMcpServer("test-oauth-server", serverUrl)
+    ).toEqual({
+      id: serverId,
+      state: "authenticating",
+      authUrl: freshAuthUrl
+    });
   });
 
   it("reconnects instead of returning unusable persisted auth URLs", async () => {

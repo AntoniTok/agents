@@ -731,6 +731,25 @@ export class MCPClientManager {
     return callback();
   }
 
+  /**
+   * Verify that a callback's state nonce is still redeemable for this server.
+   * The provider may clean up expired or mismatched state while checking it;
+   * valid state remains available until `consumeState` runs.
+   */
+  private async isRedeemableOAuthState(
+    serverId: string,
+    authProvider: AgentMcpOAuthProvider,
+    state: string
+  ): Promise<boolean> {
+    authProvider.serverId = serverId;
+    try {
+      const stateValidation = await authProvider.checkState(state);
+      return stateValidation.valid;
+    } catch {
+      return false;
+    }
+  }
+
   private async consumeStaleOAuthState(
     serverId: string,
     authProvider: AgentMcpOAuthProvider,
@@ -1499,6 +1518,28 @@ export class MCPClientManager {
           }
           return this.oauthCallbackSuccess(validation.serverId, conn);
         }
+        // Only a callback carrying a genuine state nonce may fail the
+        // connection; a stray or invalid callback must not alter the
+        // connection state machine.
+        const authProvider = conn.options.transport.authProvider;
+        if (
+          validation.state &&
+          authProvider &&
+          !(await this.isRedeemableOAuthState(
+            validation.serverId,
+            authProvider,
+            validation.state
+          ))
+        ) {
+          console.warn(
+            `[MCPClientManager] Ignoring OAuth callback with unverified state for server "${validation.serverId}": ${validation.error}`
+          );
+          return {
+            serverId: validation.serverId,
+            authSuccess: false,
+            authError: validation.error
+          };
+        }
         return this.failConnection(validation.serverId, validation.error);
       }
 
@@ -1530,7 +1571,16 @@ export class MCPClientManager {
           await this.consumeStaleOAuthState(serverId, authProvider, state);
           return this.oauthCallbackSuccess(serverId, conn);
         }
-        throw new Error(stateValidation.error || "Invalid state");
+        // Same rule as the invalid branch above: a callback whose nonce
+        // cannot be verified must not alter the connection state machine.
+        console.warn(
+          `[MCPClientManager] Ignoring OAuth callback with unverified state for server "${serverId}": ${stateValidation.error ?? "Invalid state"}`
+        );
+        return {
+          serverId,
+          authSuccess: false,
+          authError: stateValidation.error || "Invalid state"
+        };
       }
 
       // A stale popup can complete after another callback already exchanged tokens.
@@ -1540,7 +1590,13 @@ export class MCPClientManager {
         return this.oauthCallbackSuccess(serverId, conn);
       }
 
-      if (conn.connectionState !== MCPConnectionState.AUTHENTICATING) {
+      // checkState proved the nonce genuine above, so also let a FAILED
+      // connection complete: a stray or invalid callback may have spuriously
+      // failed the authorization this callback finishes.
+      if (
+        conn.connectionState !== MCPConnectionState.AUTHENTICATING &&
+        conn.connectionState !== MCPConnectionState.FAILED
+      ) {
         throw new Error(
           `Failed to authenticate: the client is in "${conn.connectionState}" state, expected "authenticating"`
         );

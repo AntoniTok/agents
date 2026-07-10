@@ -136,6 +136,9 @@ export class TestOAuthAgent extends Agent {
               const [nonce] = parts;
               self.mockStateStorage.delete(nonce);
             },
+            async redirectToAuthorization(authUrl: URL): Promise<void> {
+              this.authUrl = authUrl.toString();
+            },
             async deleteCodeVerifier(): Promise<void> {
               // No-op for tests
             }
@@ -153,6 +156,41 @@ export class TestOAuthAgent extends Agent {
 
   saveStateForTest(nonce: string, serverId: string): void {
     this.mockStateStorage.set(nonce, { serverId, createdAt: Date.now() });
+  }
+
+  // Sets the connection's live in-memory auth URL the same way a real OAuth
+  // redirect does, so tests can control how old its embedded nonce is.
+  async setLiveAuthUrlForTest(
+    serverId: string,
+    authUrl: string
+  ): Promise<void> {
+    const authProvider =
+      this.mcp.mcpConnections[serverId]?.options.transport.authProvider;
+    if (!authProvider) {
+      throw new Error(`Test error: OAuth provider ${serverId} not found`);
+    }
+    await authProvider.redirectToAuthorization(new URL(authUrl));
+  }
+
+  // Seeds a persisted OAuth state row under the same storage key the agent's
+  // real DurableObjectOAuthClientProvider reads, so tests can control how old
+  // the nonce embedded in a persisted auth_url is.
+  async seedPersistedOAuthState(
+    serverId: string,
+    nonce: string,
+    ageMs = 0
+  ): Promise<void> {
+    const provider = new DurableObjectOAuthClientProvider(
+      this.ctx.storage,
+      this.name,
+      "http://example.com/oauth/callback"
+    );
+    provider.serverId = serverId;
+    await this.ctx.storage.put(provider.stateKey(nonce), {
+      nonce,
+      serverId,
+      createdAt: Date.now() - ageMs
+    });
   }
 
   setupMockMcpConnection(

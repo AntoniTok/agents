@@ -12264,12 +12264,18 @@ export class Agent<
     if (existingServer && this.mcp.mcpConnections[existingServer.id]) {
       const conn = this.mcp.mcpConnections[existingServer.id];
       if (conn.connectionState === MCPConnectionState.AUTHENTICATING) {
-        const liveAuthUrl = conn.options.transport.authProvider?.authUrl;
+        const authProvider = conn.options.transport.authProvider;
         const authUrl =
-          liveAuthUrl ||
-          (this._isAbsoluteHttpUrl(existingServer.auth_url)
-            ? existingServer.auth_url
-            : undefined);
+          (await this._redeemableAuthUrl(
+            existingServer.id,
+            authProvider?.authUrl,
+            authProvider
+          )) ||
+          (await this._redeemableAuthUrl(
+            existingServer.id,
+            existingServer.auth_url,
+            authProvider
+          ));
         if (authUrl) {
           return {
             id: existingServer.id,
@@ -12530,6 +12536,33 @@ export class Agent<
       return url.protocol === "http:" || url.protocol === "https:";
     } catch {
       return false;
+    }
+  }
+
+  /**
+   * An auth URL embeds a one-time state nonce with a limited TTL, so both a
+   * connection's live in-memory URL and a row restored after hibernation can
+   * go stale before the flow completes. Serve a URL only while its nonce is
+   * still redeemable; otherwise the caller reconnects and mints a fresh one.
+   */
+  private async _redeemableAuthUrl(
+    serverId: string,
+    authUrl: string | null | undefined,
+    authProvider: AgentMcpOAuthProvider | undefined
+  ): Promise<string | undefined> {
+    if (!this._isAbsoluteHttpUrl(authUrl) || !authProvider) {
+      return undefined;
+    }
+    const state = new URL(authUrl).searchParams.get("state");
+    if (!state) {
+      return undefined;
+    }
+    authProvider.serverId = serverId;
+    try {
+      const stateValidation = await authProvider.checkState(state);
+      return stateValidation.valid ? authUrl : undefined;
+    } catch {
+      return undefined;
     }
   }
 
