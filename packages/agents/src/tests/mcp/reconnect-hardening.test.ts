@@ -242,7 +242,7 @@ describe("MCP reconnect hardening", () => {
       expect(restored.connectionState).toBe("ready");
     });
 
-    it("re-keys a connection tracked mid-migration and still cleans it up on settle", async () => {
+    it("waits for connection work registered while migration is already waiting", async () => {
       const { storage } = createMockStorage();
       const manager = new MCPClientManager("test-client", "1.0.0", {
         storage
@@ -252,23 +252,25 @@ describe("MCP reconnect hardening", () => {
       const first = createDeferred<void>();
       internals._trackConnection("old-id", first.promise);
 
-      const migration = manager.migrateServerId(
-        "old-id",
-        "github",
-        "test-client"
-      );
-      // Tracked while the migration awaits the first promise — this is the
-      // in-flight work the rename must re-key
+      let migrated = false;
+      const migration = manager
+        .migrateServerId("old-id", "github", "test-client")
+        .then(() => {
+          migrated = true;
+        });
+
+      // This task starts while migration is waiting on the first one. It also
+      // closes over old-id, so migration must let it settle before renaming.
       const second = createDeferred<void>();
       internals._trackConnection("old-id", second.promise);
       first.resolve();
-      await migration;
-
-      expect(internals._pendingConnections.has("old-id")).toBe(false);
-      expect(internals._pendingConnections.has("github")).toBe(true);
+      await first.promise;
+      await Promise.resolve();
+      expect(migrated).toBe(false);
 
       second.resolve();
-      await manager.waitForConnections();
+      await migration;
+
       expect(internals._pendingConnections.size).toBe(0);
     });
 

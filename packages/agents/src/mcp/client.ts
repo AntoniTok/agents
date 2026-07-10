@@ -475,14 +475,17 @@ export class MCPClientManager {
   ): Promise<void> {
     if (oldId === newId) return;
 
-    // A restore for `oldId` may be connecting/discovering in the background;
-    // its work closes over the old id (connectToServer(oldId) →
-    // discoverIfConnected(oldId)). Let it settle before the id moves, or the
-    // discovery lands on a connection that is no longer keyed under oldId and
-    // the migrated connection is left with no tools. Tracked
-    // establishConnection promises can reject (post-OAuth background
-    // connects) — swallow so a failed connect doesn't abort the rename.
-    await this._pendingConnections.get(oldId)?.catch(() => {});
+    // Connection work closes over the id it starts with
+    // (connectToServer(oldId) → discoverIfConnected(oldId)). Drain it before
+    // the id moves, including work registered while an earlier task settles,
+    // or discovery can land on a key that no longer exists. Tracked
+    // establishConnection promises may reject; their failure must not abort
+    // the rename.
+    while (true) {
+      const pending = this._pendingConnections.get(oldId);
+      if (!pending) break;
+      await pending.catch(() => {});
+    }
 
     const existing = this.sql<MCPServerRow>(
       "SELECT id FROM cf_agents_mcp_servers WHERE id = ?",
@@ -570,16 +573,6 @@ export class MCPClientManager {
     if (disposables) {
       this._connectionDisposables.set(newId, disposables);
       this._connectionDisposables.delete(oldId);
-    }
-
-    // Re-track any still-pending connection promise under the new id so
-    // waitForConnections keeps accounting for it. Re-tracked (not just
-    // re-keyed) because _trackConnection's settle-cleanup is bound to the id
-    // the promise was tracked under.
-    const pending = this._pendingConnections.get(oldId);
-    if (pending) {
-      this._pendingConnections.delete(oldId);
-      this._trackConnection(newId, pending);
     }
   }
 
