@@ -288,6 +288,17 @@ export type MCPConnectionResult =
     };
 
 /**
+ * Thrown internally to make `tryN` retry a connection that failed. Carries the
+ * failure result so it can be returned once attempts are exhausted. Never
+ * escapes {@link MCPClientManager._connectWithRetry}.
+ */
+class ConnectRetryError extends Error {
+  constructor(readonly result: MCPConnectionResult) {
+    super("MCP connection attempt failed");
+  }
+}
+
+/**
  * Result of discovering server capabilities.
  * success indicates whether discovery completed successfully.
  * state is the current connection state at time of return.
@@ -464,6 +475,15 @@ export class MCPClientManager {
   ): Promise<void> {
     if (oldId === newId) return;
 
+    // A restore for `oldId` may be connecting/discovering in the background;
+    // its work closes over the old id (connectToServer(oldId) →
+    // discoverIfConnected(oldId)). Let it settle before the id moves, or the
+    // discovery lands on a connection that is no longer keyed under oldId and
+    // the migrated connection is left with no tools. Tracked
+    // establishConnection promises can reject (post-OAuth background
+    // connects) — swallow so a failed connect doesn't abort the rename.
+    await this._pendingConnections.get(oldId)?.catch(() => {});
+
     const existing = this.sql<MCPServerRow>(
       "SELECT id FROM cf_agents_mcp_servers WHERE id = ?",
       oldId
@@ -550,6 +570,16 @@ export class MCPClientManager {
     if (disposables) {
       this._connectionDisposables.set(newId, disposables);
       this._connectionDisposables.delete(oldId);
+    }
+
+    // Re-track any still-pending connection promise under the new id so
+    // waitForConnections keeps accounting for it. Re-tracked (not just
+    // re-keyed) because _trackConnection's settle-cleanup is bound to the id
+    // the promise was tracked under.
+    const pending = this._pendingConnections.get(oldId);
+    if (pending) {
+      this._pendingConnections.delete(oldId);
+      this._trackConnection(newId, pending);
     }
   }
 
@@ -1016,6 +1046,44 @@ export class MCPClientManager {
   }
 
   /**
+   * Connect to a server, retrying transient failures with backoff.
+   *
+   * `connectToServer` reports a connection failure as a resolved
+   * `{ state: FAILED }` value, but `tryN` only retries thrown errors — so
+   * without re-throwing, the configured `retry` options never engage for the
+   * failure they exist to cover. Throw on FAILED to drive the backoff, then
+   * return the last failure result once attempts are exhausted (an
+   * AUTHENTICATING result resolves immediately and is not retried).
+   */
+  private async _connectWithRetry(
+    serverId: string,
+    retry?: RetryOptions
+  ): Promise<MCPConnectionResult> {
+    const maxAttempts = retry?.maxAttempts ?? 3;
+    const baseDelayMs = retry?.baseDelayMs ?? 500;
+    const maxDelayMs = retry?.maxDelayMs ?? 5000;
+
+    try {
+      return await tryN(
+        maxAttempts,
+        async () => {
+          const result = await this.connectToServer(serverId);
+          if (result.state === MCPConnectionState.FAILED) {
+            throw new ConnectRetryError(result);
+          }
+          return result;
+        },
+        { baseDelayMs, maxDelayMs }
+      );
+    } catch (error) {
+      if (error instanceof ConnectRetryError) {
+        return error.result;
+      }
+      throw error;
+    }
+  }
+
+  /**
    * Internal method to restore a single server connection and discovery
    */
   private async _restoreServer(
@@ -1026,21 +1094,12 @@ export class MCPClientManager {
     // If stored OAuth tokens are valid, connection will succeed automatically
     // If tokens are missing/invalid, connection will fail with Unauthorized
     // and state will be set to "authenticating"
-    const maxAttempts = retry?.maxAttempts ?? 3;
-    const baseDelayMs = retry?.baseDelayMs ?? 500;
-    const maxDelayMs = retry?.maxDelayMs ?? 5000;
-
-    const connectResult = await tryN(
-      maxAttempts,
-      async () => this.connectToServer(serverId),
-      { baseDelayMs, maxDelayMs }
-    ).catch((error) => {
-      console.error(
-        `Error connecting to ${serverId} after ${maxAttempts} attempts:`,
-        error
-      );
-      return null;
-    });
+    const connectResult = await this._connectWithRetry(serverId, retry).catch(
+      (error) => {
+        console.error(`Error connecting to ${serverId}:`, error);
+        return null;
+      }
+    );
 
     if (connectResult?.state === MCPConnectionState.CONNECTED) {
       const discoverResult = await this.discoverIfConnected(serverId);
@@ -1099,7 +1158,17 @@ export class MCPClientManager {
     // During OAuth reconnect, reuse existing connection to preserve state;
     // otherwise drop any existing connection and rebuild it.
     if (!options.reconnect?.oauthCode || !this.mcpConnections[id]) {
-      delete this.mcpConnections[id];
+      const replaced = this.mcpConnections[id];
+      if (replaced) {
+        delete this.mcpConnections[id];
+        // Close in the background — once the map entry is gone nothing else
+        // can ever close the replaced transport or its server-side session.
+        void replaced.close().catch(() => {});
+        // close() terminates the session server-side, so the persisted
+        // sessionId is now dead — clear it or the next restore resumes a
+        // session the server no longer knows.
+        this.updateStoredSessionId(id, undefined);
+      }
       this.createConnection(id, url, {
         client: options.client,
         transport: options.transport ?? {}
@@ -1645,15 +1714,7 @@ export class MCPClientManager {
     }
 
     const retry = this.getServerRetryOptions(serverId);
-    const maxAttempts = retry?.maxAttempts ?? 3;
-    const baseDelayMs = retry?.baseDelayMs ?? 500;
-    const maxDelayMs = retry?.maxDelayMs ?? 5000;
-
-    const connectResult = await tryN(
-      maxAttempts,
-      async () => this.connectToServer(serverId),
-      { baseDelayMs, maxDelayMs }
-    );
+    const connectResult = await this._connectWithRetry(serverId, retry);
     this._onServerStateChanged.fire();
 
     if (connectResult.state === MCPConnectionState.CONNECTED) {

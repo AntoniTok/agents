@@ -2569,7 +2569,10 @@ describe("MCPClientManager OAuth Integration", () => {
         name: "Test Server",
         callbackUrl: "http://localhost:3000/callback",
         client: {},
-        transport: { type: "auto" }
+        transport: { type: "auto" },
+        // A failed connect is retried, but the init mock below only resolves
+        // once — pin a single attempt so the failure settles immediately.
+        retry: { maxAttempts: 1 }
       });
 
       let resolveInit!: () => void;
