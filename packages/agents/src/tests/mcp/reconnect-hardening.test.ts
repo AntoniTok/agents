@@ -264,8 +264,9 @@ describe("MCP reconnect hardening", () => {
       const second = createDeferred<void>();
       internals._trackConnection("old-id", second.promise);
       first.resolve();
-      await first.promise;
-      await Promise.resolve();
+      // Macrotask flush: give a rename that stopped draining after the first
+      // settle time to (incorrectly) run to completion before asserting.
+      await new Promise((resolve) => setTimeout(resolve, 0));
       expect(migrated).toBe(false);
 
       second.resolve();

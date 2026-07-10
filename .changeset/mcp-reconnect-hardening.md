@@ -19,4 +19,7 @@ MCP client: reconnect hardening — retry failed connections, settle in-flight r
   next wake.
 - `connect()` now closes an existing connection before replacing it, instead
   of dropping it from the connection map with its transport (and any
-  server-side session) still open.
+  server-side session) still open. Closing terminates the server-side
+  session, so the persisted session id is cleared too — the replacement (and
+  any later restore) starts with a fresh initialize instead of resuming the
+  terminated session.
