@@ -104,20 +104,16 @@ export type MCPClientConnectionResult = {
 
 /**
  * Result of a discovery operation.
- * success indicates whether discovery completed successfully.
- * error is present when success is false.
+ * Failures are tagged with a `reason` so callers can branch on why
+ * discovery failed:
+ * - `"error"`: a generic failure; retrying discovery is the caller's call.
+ * - `"stale-session"`: a resumed streamable-http session was rejected with
+ *   an HTTP 404 — the server no longer knows the persisted session, so the
+ *   caller must clear it and re-initialize without a session ID.
  */
-export type MCPDiscoveryResult = {
-  success: boolean;
-  error?: string;
-  /**
-   * Set when a resumed streamable-http session was rejected with an HTTP 404
-   * during discovery: the server no longer knows the persisted session, so
-   * the caller must clear it and re-initialize without a session ID.
-   * @internal
-   */
-  staleSession?: boolean;
-};
+export type MCPDiscoveryResult =
+  | { success: true }
+  | { success: false; reason: "error" | "stale-session"; error: string };
 
 /**
  * Handler for server-initiated `elicitation/create` requests.
@@ -555,6 +551,7 @@ export class MCPClientConnection {
       });
       return {
         success: false,
+        reason: "error",
         error: `Discovery skipped - connection in ${this.connectionState} state`
       };
     }
@@ -630,15 +627,16 @@ export class MCPClientConnection {
       // An HTTP 404 while probing a resumed streamable-http session means
       // the server expired the persisted session. The MCP spec requires
       // starting a new session by re-initializing without a session ID —
-      // flag it so the manager can clear the session and reconnect.
-      if (
+      // tag it so the manager can clear the session and reconnect.
+      const staleSession =
         this._probingCapabilities &&
         e instanceof StreamableHTTPError &&
-        e.code === 404
-      ) {
-        return { success: false, error, staleSession: true };
-      }
-      return { success: false, error };
+        e.code === 404;
+      return {
+        success: false,
+        reason: staleSession ? "stale-session" : "error",
+        error
+      };
     } finally {
       // Clean up the abort controller
       this._discoveryAbortController = undefined;

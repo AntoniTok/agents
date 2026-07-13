@@ -523,8 +523,10 @@ describe("MCP Client Connection Integration", () => {
       // Trigger discovery - should fail and return error result
       const result = await connection.discover();
 
-      expect(result.success).toBe(false);
-      expect(result.error).toContain("Instructions service down");
+      expect(result).toMatchObject({
+        success: false,
+        error: expect.stringContaining("Instructions service down")
+      });
 
       // Connection should return to connected state (not failed) so user can retry
       expect(connection.connectionState).toBe("connected");
@@ -624,8 +626,10 @@ describe("MCP Client Connection Integration", () => {
       // Trigger discovery - should fail
       const result = await connection.discover();
 
-      expect(result.success).toBe(false);
-      expect(result.error).toContain("All services down");
+      expect(result).toMatchObject({
+        success: false,
+        error: expect.stringContaining("All services down")
+      });
 
       // Connection should return to connected state (not failed) so user can retry
       expect(connection.connectionState).toBe("connected");

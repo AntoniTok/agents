@@ -308,9 +308,11 @@ describe("MCP streamable-http stale session recovery", () => {
     await connection.init();
     const result = await connection.discover();
 
-    expect(result.success).toBe(false);
-    expect(result.error).toContain("Application resource not found");
-    expect(result).not.toHaveProperty("staleSession");
+    expect(result).toMatchObject({
+      success: false,
+      reason: "error",
+      error: expect.stringContaining("Application resource not found")
+    });
   });
 
   it("clears storage before attempting the fresh connection", async () => {
@@ -340,8 +342,8 @@ describe("MCP streamable-http stale session recovery", () => {
     connection.connectionState = "connected";
     connection.discover = vi.fn().mockResolvedValue({
       success: false,
-      error: "Streamable HTTP error: unknown session",
-      staleSession: true
+      reason: "stale-session",
+      error: "Streamable HTTP error: unknown session"
     });
     const clearResumedSession = vi.spyOn(connection, "clearResumedSession");
     vi.spyOn(manager, "connectToServer").mockRejectedValue(
@@ -385,8 +387,8 @@ describe("MCP streamable-http stale session recovery", () => {
     connection.connectionState = "connected";
     const discover = vi.fn().mockResolvedValue({
       success: false,
-      error: "Streamable HTTP error: unknown session",
-      staleSession: true
+      reason: "stale-session",
+      error: "Streamable HTTP error: unknown session"
     });
     connection.discover = discover;
     vi.spyOn(manager, "connectToServer").mockResolvedValue({

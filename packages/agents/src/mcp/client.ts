@@ -23,6 +23,7 @@ import {
   elicitationCapabilitiesFromHandlers,
   MCPClientConnection,
   MCPConnectionState,
+  type MCPDiscoveryResult,
   type MCPElicitationHandlers,
   type MCPTransportOptions
 } from "./client-connection";
@@ -1594,16 +1595,23 @@ export class MCPClientManager {
     }
 
     // Delegate to connection's discover method which handles cancellation and timeout
-    const { staleSession, ...result } = await conn.discover(options);
-    if (staleSession) {
+    const result = await conn.discover(options);
+    if (!result.success && result.reason === "stale-session") {
       return this._recoverStaleSession(conn, serverId, options);
     }
     this._onServerStateChanged.fire();
 
-    return {
-      ...result,
-      state: conn.connectionState
-    };
+    return this._toDiscoverResult(conn, result);
+  }
+
+  /** Attach the connection's current state to a discovery outcome. */
+  private _toDiscoverResult(
+    conn: MCPClientConnection,
+    result: MCPDiscoveryResult
+  ): MCPDiscoverResult {
+    return result.success
+      ? { success: true, state: conn.connectionState }
+      : { success: false, error: result.error, state: conn.connectionState };
   }
 
   /**
@@ -1644,13 +1652,10 @@ export class MCPClientManager {
       };
     }
 
-    const { staleSession: _, ...result } = await conn.discover(options);
+    const result = await conn.discover(options);
     this._onServerStateChanged.fire();
 
-    return {
-      ...result,
-      state: conn.connectionState
-    };
+    return this._toDiscoverResult(conn, result);
   }
 
   /**
