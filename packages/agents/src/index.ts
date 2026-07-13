@@ -73,6 +73,7 @@ import type {
 import { MCPConnectionState } from "./mcp/client-connection";
 import {
   DurableObjectOAuthClientProvider,
+  hasRedeemableOAuthState,
   type AgentMcpOAuthProvider
 } from "./mcp/do-oauth-client-provider";
 import type { TransportType } from "./mcp/types";
@@ -12557,13 +12558,12 @@ export class Agent<
     if (!state) {
       return undefined;
     }
-    authProvider.serverId = serverId;
-    try {
-      const stateValidation = await authProvider.checkState(state);
-      return stateValidation.valid ? authUrl : undefined;
-    } catch {
-      return undefined;
-    }
+    const redeemable = await hasRedeemableOAuthState(
+      authProvider,
+      serverId,
+      state
+    );
+    return redeemable ? authUrl : undefined;
   }
 
   async removeMcpServer(id: string) {

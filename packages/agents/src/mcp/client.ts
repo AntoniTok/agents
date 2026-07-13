@@ -30,8 +30,11 @@ import { toErrorMessage } from "./errors";
 import { RPC_DO_PREFIX } from "./rpc";
 import type { TransportType } from "./types";
 import type { MCPServerRow } from "./client-storage";
-import type { AgentMcpOAuthProvider } from "./do-oauth-client-provider";
-import { DurableObjectOAuthClientProvider } from "./do-oauth-client-provider";
+import {
+  type AgentMcpOAuthProvider,
+  DurableObjectOAuthClientProvider,
+  hasRedeemableOAuthState
+} from "./do-oauth-client-provider";
 
 export type MCPAITool = {
   description?: string;
@@ -732,22 +735,18 @@ export class MCPClientManager {
   }
 
   /**
-   * Verify that a callback's state nonce is still redeemable for this server.
-   * The provider may clean up expired or mismatched state while checking it;
-   * valid state remains available until `consumeState` runs.
+   * A callback whose state nonce cannot be verified must not alter the
+   * connection state machine: log and report the failure without touching
+   * the connection.
    */
-  private async isRedeemableOAuthState(
+  private ignoreUnverifiedCallback(
     serverId: string,
-    authProvider: AgentMcpOAuthProvider,
-    state: string
-  ): Promise<boolean> {
-    authProvider.serverId = serverId;
-    try {
-      const stateValidation = await authProvider.checkState(state);
-      return stateValidation.valid;
-    } catch {
-      return false;
-    }
+    error: string
+  ): MCPOAuthCallbackResult {
+    console.warn(
+      `[MCPClientManager] Ignoring OAuth callback with unverified state for server "${serverId}": ${error}`
+    );
+    return { serverId, authSuccess: false, authError: error };
   }
 
   private async consumeStaleOAuthState(
@@ -1525,20 +1524,16 @@ export class MCPClientManager {
         if (
           validation.state &&
           authProvider &&
-          !(await this.isRedeemableOAuthState(
-            validation.serverId,
+          !(await hasRedeemableOAuthState(
             authProvider,
+            validation.serverId,
             validation.state
           ))
         ) {
-          console.warn(
-            `[MCPClientManager] Ignoring OAuth callback with unverified state for server "${validation.serverId}": ${validation.error}`
+          return this.ignoreUnverifiedCallback(
+            validation.serverId,
+            validation.error
           );
-          return {
-            serverId: validation.serverId,
-            authSuccess: false,
-            authError: validation.error
-          };
         }
         return this.failConnection(validation.serverId, validation.error);
       }
@@ -1573,14 +1568,10 @@ export class MCPClientManager {
         }
         // Same rule as the invalid branch above: a callback whose nonce
         // cannot be verified must not alter the connection state machine.
-        console.warn(
-          `[MCPClientManager] Ignoring OAuth callback with unverified state for server "${serverId}": ${stateValidation.error ?? "Invalid state"}`
-        );
-        return {
+        return this.ignoreUnverifiedCallback(
           serverId,
-          authSuccess: false,
-          authError: stateValidation.error || "Invalid state"
-        };
+          stateValidation.error || "Invalid state"
+        );
       }
 
       // A stale popup can complete after another callback already exchanged tokens.

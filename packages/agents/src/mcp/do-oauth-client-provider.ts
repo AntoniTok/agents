@@ -43,6 +43,26 @@ export interface AgentMcpOAuthProvider extends OAuthClientProvider {
   deleteCodeVerifier(): Promise<void>;
 }
 
+/**
+ * Verify that an OAuth callback's state nonce is still redeemable for a
+ * server. The provider may clean up expired or mismatched state while
+ * checking it; valid state remains available until `consumeState` runs.
+ * Any error while checking is treated as "not redeemable".
+ */
+export async function hasRedeemableOAuthState(
+  authProvider: AgentMcpOAuthProvider,
+  serverId: string,
+  state: string
+): Promise<boolean> {
+  authProvider.serverId = serverId;
+  try {
+    const stateValidation = await authProvider.checkState(state);
+    return stateValidation.valid;
+  } catch {
+    return false;
+  }
+}
+
 function parseOAuthState(
   state: string
 ): { nonce: string; serverId: string } | undefined {
