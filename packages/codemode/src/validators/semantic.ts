@@ -1,10 +1,11 @@
-import { experimentalAnalyze } from "workerd-oxc";
+import { experimentalAnalyze, parse } from "workerd-oxc";
 import type {
   CodemodeValidationIssue,
   CodemodeValidationResult,
   CodeValidationContext,
   CodemodeValidator
 } from "../validation";
+import type { ConnectorDescription } from "../connectors";
 import { AMBIENT_SANDBOX_GLOBALS, BUILTIN_PROVIDER_GLOBALS } from "./globals";
 
 export type SemanticValidatorOptions = {
@@ -17,6 +18,12 @@ export type SemanticValidatorOptions = {
    * references to them would be reported as unknown connectors.
    */
   allowedGlobals?: readonly string[];
+  /**
+   * Also reject calls to methods that do not exist on a configured connector
+   * (e.g. `github.no_such_method()`). Defaults to `true`. Connectors whose
+   * descriptors are empty are skipped (their method set is unknown).
+   */
+  checkMethods?: boolean;
   /** Maximum number of issues to report. Defaults to 10. */
   maxIssues?: number;
 };
@@ -24,15 +31,18 @@ export type SemanticValidatorOptions = {
 const DEFAULT_MAX_ISSUES = 10;
 
 /**
- * A code validator that rejects generated programs referencing connectors that
- * are not configured on the runtime. Such code parses fine but throws the
- * moment it runs (e.g. `slack is not defined`), so rejecting it here avoids a
- * wasted dynamic Worker execution.
+ * A code validator that rejects generated programs which cannot succeed at
+ * runtime because they reference things that do not exist:
  *
- * Detection uses the Oxc semantic analyzer (`workerd-oxc`): connectors are
- * injected as sandbox globals, so a reference to an unconfigured connector
- * appears as an unresolved identifier. Ambient JavaScript/Workers globals and
- * the built-in `codemode` provider are subtracted from that set.
+ * - **Unknown connectors** — a bare identifier that is neither a configured
+ *   connector, the built-in `codemode` provider, nor an ambient global. Such
+ *   code throws `X is not defined` the moment it runs.
+ * - **Unknown methods** (opt-out) — a call to a method that a configured
+ *   connector does not expose.
+ *
+ * Both classes of error parse fine but waste a dynamic Worker execution, so
+ * catching them here saves that cost. Detection uses the Oxc semantic analyzer
+ * and parser compiled to WebAssembly (`workerd-oxc`).
  */
 export function semanticValidator(
   options: SemanticValidatorOptions = {}
@@ -40,6 +50,7 @@ export function semanticValidator(
   const name = options.name ?? "semantic";
   const maxIssues = options.maxIssues ?? DEFAULT_MAX_ISSUES;
   const extraGlobals = options.allowedGlobals ?? [];
+  const checkMethods = options.checkMethods ?? true;
 
   return {
     name,
@@ -67,12 +78,23 @@ export function semanticValidator(
       const issues: CodemodeValidationIssue[] = [];
       const reported = new Set<string>();
 
+      // L2A: unknown connectors / undefined variables.
       for (const ref of analyzed.value.unresolved) {
         if (allowed.has(ref.name)) continue;
         if (reported.has(ref.name)) continue;
         reported.add(ref.name);
         if (issues.length >= maxIssues) break;
         issues.push(unknownConnectorIssue(ref, connectorNames, context));
+      }
+
+      // L2B: calls to methods a configured connector does not expose.
+      if (checkMethods && issues.length < maxIssues) {
+        const methodIssues = await findUnknownMethodCalls(
+          context,
+          context.connectors,
+          maxIssues - issues.length
+        );
+        issues.push(...methodIssues);
       }
 
       return issues.length > 0 ? { valid: false, issues } : { valid: true };
@@ -100,9 +122,135 @@ function unknownConnectorIssue(
   };
 }
 
+// ---------------------------------------------------------------------------
+// L2B — unknown method calls
+// ---------------------------------------------------------------------------
+
+type AstNode = { type?: string; [key: string]: unknown };
+
+async function findUnknownMethodCalls(
+  context: CodeValidationContext,
+  connectors: readonly ConnectorDescription[],
+  budget: number
+): Promise<CodemodeValidationIssue[]> {
+  const parsed = await parse({
+    filename: "codemode.js",
+    source: context.normalizedCode,
+    lang: "js"
+  });
+  if (!parsed.ok) return [];
+
+  // Only check connectors whose method set is actually known.
+  const methodsByConnector = new Map<string, Set<string>>();
+  for (const c of connectors) {
+    const methods = Object.keys(c.descriptors);
+    if (methods.length > 0) methodsByConnector.set(c.name, new Set(methods));
+  }
+  if (methodsByConnector.size === 0) return [];
+
+  const issues: CodemodeValidationIssue[] = [];
+  const reported = new Set<string>();
+
+  const visit = (node: unknown): void => {
+    if (issues.length >= budget) return;
+    if (!node || typeof node !== "object") return;
+    if (Array.isArray(node)) {
+      for (const child of node) visit(child);
+      return;
+    }
+    const n = node as AstNode;
+
+    if (n.type === "CallExpression") {
+      const callee = n.callee as AstNode | undefined;
+      if (callee?.type === "MemberExpression") {
+        const call = readConnectorMethodCall(callee);
+        if (call) {
+          const methods = methodsByConnector.get(call.connector);
+          const key = `${call.connector}.${call.method}`;
+          if (methods && !methods.has(call.method) && !reported.has(key)) {
+            reported.add(key);
+            if (issues.length < budget) {
+              issues.push(unknownMethodIssue(call, methods, context));
+            }
+          }
+        }
+      }
+    }
+
+    for (const key of Object.keys(n)) {
+      if (key === "type") continue;
+      visit(n[key]);
+    }
+  };
+
+  visit(parsed.value.ast);
+  return issues;
+}
+
+type MethodCall = {
+  connector: string;
+  method: string;
+  offset?: number;
+};
+
+/**
+ * Read a `<connector>.<method>` or `<connector>["<method>"]` member expression.
+ * Returns `undefined` for anything dynamic or nested that cannot be checked
+ * statically, so the validator stays conservative and avoids false positives.
+ */
+function readConnectorMethodCall(member: AstNode): MethodCall | undefined {
+  const object = member.object as AstNode | undefined;
+  if (object?.type !== "Identifier") return undefined;
+  const connector = object.name;
+  if (typeof connector !== "string") return undefined;
+
+  const property = member.property as AstNode | undefined;
+  const computed = member.computed === true;
+
+  if (!computed && property?.type === "Identifier") {
+    const method = property.name;
+    if (typeof method !== "string") return undefined;
+    return { connector, method, offset: numberOrUndefined(property.start) };
+  }
+
+  if (computed && property?.type === "Literal") {
+    const value = property.value;
+    if (typeof value !== "string") return undefined;
+    return {
+      connector,
+      method: value,
+      offset: numberOrUndefined(property.start)
+    };
+  }
+
+  return undefined;
+}
+
+function unknownMethodIssue(
+  call: MethodCall,
+  methods: ReadonlySet<string>,
+  context: CodeValidationContext
+): CodemodeValidationIssue {
+  const available = [...methods].sort();
+  const path =
+    call.offset !== undefined
+      ? formatLocation(context.normalizedCode, call.offset)
+      : undefined;
+  return {
+    message: `"${call.method}" is not a method on connector "${call.connector}".`,
+    code: "unknown-method",
+    suggestion: `Available methods on "${call.connector}": ${available.join(", ")}.`,
+    ...(path ? { path } : {})
+  };
+}
+
+function numberOrUndefined(value: unknown): number | undefined {
+  return typeof value === "number" ? value : undefined;
+}
+
 /**
  * Convert a UTF-16 string offset into a 1-based `line:column` label for
- * diagnostics. `experimentalAnalyze` reports spans as string offsets.
+ * diagnostics. `experimentalAnalyze` and the parser report string offsets.
  */
 function formatLocation(source: string, offset: number): string {
   let line = 1;
