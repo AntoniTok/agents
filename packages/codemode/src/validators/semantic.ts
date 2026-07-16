@@ -89,10 +89,23 @@ export function semanticValidator(
 
       // L2B: calls to methods a configured connector does not expose.
       if (checkMethods && issues.length < maxIssues) {
+        // Only method-check identifiers that are genuinely the injected
+        // connector global. A connector name shadowed by a local binding is a
+        // *resolved* reference, so it never appears in `unresolved` and its
+        // offset is absent here — which keeps L2B from flagging locals.
+        const connectorNameSet = new Set(connectorNames);
+        const connectorGlobalOffsets = new Set<number>();
+        for (const ref of analyzed.value.unresolved) {
+          if (connectorNameSet.has(ref.name) && ref.span) {
+            connectorGlobalOffsets.add(ref.span.start);
+          }
+        }
+
         const methodIssues = await findUnknownMethodCalls(
           context,
           context.connectors,
-          maxIssues - issues.length
+          maxIssues - issues.length,
+          connectorGlobalOffsets
         );
         issues.push(...methodIssues);
       }
@@ -131,7 +144,8 @@ type AstNode = { type?: string; [key: string]: unknown };
 async function findUnknownMethodCalls(
   context: CodeValidationContext,
   connectors: readonly ConnectorDescription[],
-  budget: number
+  budget: number,
+  connectorGlobalOffsets: ReadonlySet<number>
 ): Promise<CodemodeValidationIssue[]> {
   const parsed = await parse({
     filename: "codemode.js",
@@ -164,7 +178,14 @@ async function findUnknownMethodCalls(
       const callee = n.callee as AstNode | undefined;
       if (callee?.type === "MemberExpression") {
         const call = readConnectorMethodCall(callee);
-        if (call) {
+        // Skip unless this exact identifier is the injected connector global
+        // (present in the unresolved set), so a shadowing local is never
+        // method-checked against the connector's descriptors.
+        if (
+          call &&
+          call.objectOffset !== undefined &&
+          connectorGlobalOffsets.has(call.objectOffset)
+        ) {
           const methods = methodsByConnector.get(call.connector);
           const key = `${call.connector}.${call.method}`;
           if (methods && !methods.has(call.method) && !reported.has(key)) {
@@ -190,7 +211,10 @@ async function findUnknownMethodCalls(
 type MethodCall = {
   connector: string;
   method: string;
+  /** Start offset of the method identifier/literal, for diagnostics. */
   offset?: number;
+  /** Start offset of the object identifier, used to confirm it is the global. */
+  objectOffset?: number;
 };
 
 /**
@@ -203,6 +227,7 @@ function readConnectorMethodCall(member: AstNode): MethodCall | undefined {
   if (object?.type !== "Identifier") return undefined;
   const connector = object.name;
   if (typeof connector !== "string") return undefined;
+  const objectOffset = numberOrUndefined(object.start);
 
   const property = member.property as AstNode | undefined;
   const computed = member.computed === true;
@@ -210,7 +235,12 @@ function readConnectorMethodCall(member: AstNode): MethodCall | undefined {
   if (!computed && property?.type === "Identifier") {
     const method = property.name;
     if (typeof method !== "string") return undefined;
-    return { connector, method, offset: numberOrUndefined(property.start) };
+    return {
+      connector,
+      method,
+      offset: numberOrUndefined(property.start),
+      objectOffset
+    };
   }
 
   if (computed && property?.type === "Literal") {
@@ -219,7 +249,8 @@ function readConnectorMethodCall(member: AstNode): MethodCall | undefined {
     return {
       connector,
       method: value,
-      offset: numberOrUndefined(property.start)
+      offset: numberOrUndefined(property.start),
+      objectOffset
     };
   }
 
