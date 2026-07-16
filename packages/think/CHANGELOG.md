@@ -1,5 +1,11 @@
 # @cloudflare/think
 
+## 0.13.1
+
+### Patch Changes
+
+- [#1937](https://github.com/cloudflare/agents/pull/1937) [`ed9f42b`](https://github.com/cloudflare/agents/commit/ed9f42b447f244a20801cf2cbcba72a191f73c9d) Thanks [@cjol](https://github.com/cjol)! - Forward routing props through the Think `onStart` lifecycle wrapper.
+
 ## 0.13.0
 
 ### Minor Changes

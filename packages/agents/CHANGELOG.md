@@ -1,5 +1,11 @@
 # @cloudflare/agents
 
+## 0.17.5
+
+### Patch Changes
+
+- [#1944](https://github.com/cloudflare/agents/pull/1944) [`fff4131`](https://github.com/cloudflare/agents/commit/fff413112915cfafcbca013a764065abc6105db1) Thanks [@cjol](https://github.com/cjol)! - Make the `agents/vite` `turndown` stub fail with a diagnostic error when app code calls it directly, and document the `stubTurndown: false` opt-out for applications that use `turndown` themselves.
+
 ## 0.17.4
 
 ### Patch Changes
